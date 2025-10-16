@@ -1,0 +1,134 @@
+---
+- name: Bootstrap Jenkins server (Amazon Linux 2) - shell-based safe fallback
+  hosts: jenkins
+  become: yes
+
+  tasks:
+    - name: Wait for cloud-init / package manager to be ready
+      wait_for:
+        path: /var/lib/cloud/instance
+        state: present
+        timeout: 120
+      ignore_errors: yes
+
+    - name: Ensure Python3 is available (debug)
+      shell: |
+        which python3 || (yum -y install python3 || true)
+      args:
+        executable: /bin/bash
+      register: py3check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Update packages (shell fallback)
+      shell: |
+        yum -y update
+      args:
+        executable: /bin/bash
+      register: yum_update
+      failed_when: yum_update.rc != 0
+      ignore_errors: no
+
+    - name: Install base packages (shell fallback)
+      shell: |
+        yum -y install java-11-amazon-corretto-headless git unzip curl jq awscli || yum -y install java-11-openjdk-headless git unzip curl jq awscli
+      args:
+        executable: /bin/bash
+      register: base_pkgs
+      failed_when: base_pkgs.rc != 0
+      ignore_errors: no
+
+    - name: Install docker (shell fallback)
+      shell: |
+        yum -y install docker || true
+        systemctl enable --now docker || true
+      args:
+        executable: /bin/bash
+      register: docker_install
+      failed_when: false
+      ignore_errors: yes
+
+    - name: Add ec2-user to docker group
+      shell: |
+        usermod -aG docker ec2-user || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Add Jenkins yum repo (shell)
+      shell: |
+        curl -fsSL https://pkg.jenkins.io/redhat-stable/jenkins.repo -o /etc/yum.repos.d/jenkins.repo
+        rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io.key || true
+      args:
+        executable: /bin/bash
+      register: add_jenkins_repo
+      failed_when: add_jenkins_repo.rc != 0
+      ignore_errors: no
+
+    - name: Install Jenkins (shell fallback)
+      shell: |
+        yum -y install jenkins || true
+        systemctl enable --now jenkins || true
+      args:
+        executable: /bin/bash
+      register: jenkins_install
+      failed_when: false
+      ignore_errors: yes
+
+    - name: Install kubectl (download latest stable)
+      shell: |
+        set -e
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        mv kubectl /usr/local/bin/kubectl
+      args:
+        executable: /bin/bash
+      register: kubectl_install
+      changed_when: kubectl_install.rc == 0
+      failed_when: kubectl_install.rc != 0
+      ignore_errors: yes
+
+    - name: Ensure /var/lib/jenkins/.kube exists
+      file:
+        path: /var/lib/jenkins/.kube
+        state: directory
+        owner: jenkins
+        group: jenkins
+        mode: '0700'
+      ignore_errors: yes
+
+    - name: Ensure /usr/local/bin exists
+      file:
+        path: /usr/local/bin
+        state: directory
+        mode: '0755'
+
+    - name: Add jenkins to docker group and restart jenkins (safe)
+      shell: |
+        usermod -aG docker jenkins || true
+        systemctl restart jenkins || true
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Install docker-compose (best-effort)
+      shell: |
+        set -e
+        curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose || true
+        chmod +x /usr/local/bin/docker-compose || true
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Stop firewalld if present
+      service:
+        name: firewalld
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Print reminder about initial admin password
+      debug:
+        msg: "Jenkins installed (or attempted). InitialAdminPassword is at /var/lib/jenkins/secrets/initialAdminPassword (use sudo to read)."
+
