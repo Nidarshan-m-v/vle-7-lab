@@ -1,91 +1,130 @@
-// Jenkinsfile - Blue/Green pipeline (Node.js example)
-// Replace <DOCKERHUB_USER> with your Docker Hub username before committing.
-
+// Jenkinsfile - Declarative pipeline
 pipeline {
   agent any
 
+  // Allow turning on/off K8s deploy from job parameters
+  parameters {
+    booleanParam(name: 'DEPLOY_TO_K8S', defaultValue: false, description: 'If true, deploy to Kubernetes (requires kubeconfig credential)')
+  }
+
   environment {
-    DOCKERHUB_USER = 'nidarshanmv'              // <-- REPLACE this
-    IMAGE          = "${DOCKERHUB_USER}/myapp:${BUILD_NUMBER}"
-    KUBECTL        = '/usr/local/bin/kubectl'        // adjust if kubectl is at another path
-    DEPLOY_BLUE    = 'deployment-blue.yaml'
-    DEPLOY_GREEN   = 'deployment-green.yaml'
-    SERVICE_FILE   = 'service.yaml'
-    DEPLOY_BLUE_NAME  = 'myapp-blue'
-    DEPLOY_GREEN_NAME = 'myapp-green'
-    SERVICE_NAME      = 'myapp-service'
+    // Ensure the pipeline shells see the node/npm installed in /usr/local/bin
+    PATH = "/usr/local/bin:${env.PATH}"
+    // Docker image name (adjust to your dockerhub repo)
+    IMAGE_NAME = "nidarshanmv/myapp"    // <-- EDIT: replace with your DockerHub repo
+    IMAGE_TAG  = "${env.BUILD_ID}"
   }
 
   options {
+    // basic options
     timestamps()
     ansiColor('xterm')
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-    timeout(time: 60, unit: 'MINUTES')
+    timeout(time: 1, unit: 'HOURS')
   }
 
   stages {
-    stage('Prepare / Checkout') {
+    stage('Checkout') {
       steps {
-        // declarative pipeline already performs a checkout, but explicitly ensure we use the same revision
         checkout scm
-        sh 'echo "Workspace: $(pwd)"; ls -la'
+        sh 'pwd; ls -la'
       }
     }
 
     stage('Install deps') {
       steps {
-        // Node app example - adjust if using Maven/Gradle for Java
-        sh 'npm ci || npm install'
+        // This runs as the jenkins user; PATH includes /usr/local/bin so node/npm should be found
+        sh '''
+          echo "node: $(which node || true) $(node -v || true)"
+          echo "npm: $(which npm || true) $(npm -v || true)"
+        '''
+        // If your project is Node.js
+        sh '''
+          if [ -f package-lock.json ] || [ -f package.json ]; then
+            npm ci || npm install
+          else
+            echo "No package.json found, skipping npm install"
+          fi
+        '''
       }
     }
 
     stage('Build Docker image') {
       steps {
-        sh 'docker build -t $IMAGE .'
+        sh 'docker --version || true'
+        sh 'cat Dockerfile || true'
+        sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
       }
     }
 
     stage('Login & Push to Docker Hub') {
       steps {
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-          sh 'echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin'
-          sh 'docker push $IMAGE'
-          sh 'docker logout || true'
+          sh '''
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+            docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+            docker push ${IMAGE_NAME}:latest
+            docker logout
+          '''
         }
       }
     }
 
     stage('Deploy green (create/update)') {
+      when {
+        expression { params.DEPLOY_TO_K8S == true }
+      }
       steps {
-        // apply green deployment and set the image
-        sh '''
-$KUBECTL apply -f $DEPLOY_GREEN || true
-$KUBECTL set image deployment/$DEPLOY_GREEN_NAME myapp=$IMAGE --record || true
-$KUBECTL rollout status deployment/$DEPLOY_GREEN_NAME --timeout=180s || true
-'''
+        // Use kubeconfig file credential if provided in Jenkins credentials as file
+        withCredentials([file(credentialsId: 'kubeconfig-file', variable: 'KUBECONFIG_FILE')]) {
+          // copy file to workspace KUBECONFIG path
+          sh '''
+            export KUBECONFIG="$KUBECONFIG_FILE"
+            kubectl version --short
+            # Replace deployments (use your deployment filenames)
+            kubectl apply -f deployment-green.yaml || true
+            # ensure service points to green (or do the switch later)
+            kubectl patch service myapp-service -p '{"spec":{"selector":{"app":"myapp","color":"green"}}}' || true
+          '''
+        }
       }
     }
 
     stage('Manual validation & switch traffic') {
+      when {
+        expression { params.DEPLOY_TO_K8S == true }
+      }
       steps {
-        // manual verification: approve to switch service selector to green
-        timeout(time: 30, unit: 'MINUTES') {
-          input message: "Validate the GREEN deployment and approve switching traffic to GREEN?"
+        input message: "Validate the green deployment and then approve to switch traffic to green", ok: "Switch"
+        withCredentials([file(credentialsId: 'kubeconfig-file', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG="$KUBECONFIG_FILE"
+            # switch service to green
+            kubectl patch service myapp-service -p '{"spec":{"selector":{"app":"myapp","color":"green"}}}'
+          '''
         }
-        // patch the service selector to point to green
-        sh '$KUBECTL patch service $SERVICE_NAME -p "{\"spec\":{\"selector\":{\"app\":\"myapp\",\"color\":\"green\"}}}"'
       }
     }
-  }
+  } // stages
 
   post {
-    success {
-      echo "Pipeline completed successfully — GREEN is live (if switched)."
-    }
     failure {
-      echo "Pipeline FAILED — attempting safe rollback (switch service back to BLUE)."
-      sh '$KUBECTL patch service $SERVICE_NAME -p "{\"spec\":{\"selector\":{\"app\":\"myapp\",\"color\":\"blue\"}}}" || true'
-      error("Pipeline failed - manual investigation required.")
+      echo "Pipeline FAILED — rollback attempt or manual investigation required."
+      // Try safe rollback only if kube deploy was attempted
+      script {
+        if (params.DEPLOY_TO_K8S == true) {
+          withCredentials([file(credentialsId: 'kubeconfig-file', variable: 'KUBECONFIG_FILE')]) {
+            sh '''
+              export KUBECONFIG="$KUBECONFIG_FILE"
+              # attempt to set service back to blue (best-effort)
+              kubectl patch service myapp-service -p '{"spec":{"selector":{"app":"myapp","color":"blue"}}}' || true
+            '''
+          }
+        }
+      }
+    }
+    success {
+      echo "Pipeline finished successfully."
     }
   }
 }
